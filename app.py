@@ -1,241 +1,372 @@
+# STAR LIKE API SRC  
+# POWERED BY : @STAR_GMR
+# CHANNEL : @STAR_METHODE
 from flask import Flask, request, jsonify
 import asyncio
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
-from google.protobuf.json_format import MessageToJson
 import binascii
 import aiohttp
 import requests
 import json
-from proto import like_pb2  # If your folder is named "Proto"
-from proto import like_count_pb2
-from proto import uid_generator_pb2
-from google.protobuf.message import DecodeError
+import like_pb2
+import like_count_pb2
+import uid_generator_pb2
+import threading
+import urllib3
+import random
 
-app = Flask(__name__)
+# Configuration
+TOKEN_BATCH_SIZE = 1500
+MIN_LEVEL = 5  # Minimum account level required to send likes (level 1-4 are blocked by FF server)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-def load_tokens(server_name):
-    try:
-        if server_name == "IND":
-            with open("token_ind.json", "r") as f:
-                tokens = json.load(f)
-        elif server_name in {"BR", "US", "SAC", "NA"}:
-            with open("token_br.json", "r") as f:
-                tokens = json.load(f)
+# Global State for Batch Management
+current_batch_indices = {}
+batch_indices_lock = threading.Lock()
+
+def get_next_batch_tokens(server_name, all_tokens):
+    if not all_tokens:
+        return []
+    
+    total_tokens = len(all_tokens)
+    
+    # If we have fewer tokens than batch size, use all available tokens
+    if total_tokens <= TOKEN_BATCH_SIZE:
+        return all_tokens
+    
+    with batch_indices_lock:
+        if server_name not in current_batch_indices:
+            current_batch_indices[server_name] = 0
+        
+        current_index = current_batch_indices[server_name]
+        
+        # Calculate the batch
+        start_index = current_index
+        end_index = start_index + TOKEN_BATCH_SIZE
+        
+        # If we reach or exceed the end, wrap around
+        if end_index > total_tokens:
+            remaining = end_index - total_tokens
+            batch_tokens = all_tokens[start_index:total_tokens] + all_tokens[0:remaining]
         else:
-            with open("token_bd.json", "r") as f:
-                tokens = json.load(f)
-        return tokens
-    except Exception as e:
-        app.logger.error(f"Error loading tokens for server {server_name}: {e}")
-        return None
+            batch_tokens = all_tokens[start_index:end_index]
+        
+        # Update the index for next time
+        next_index = (current_index + TOKEN_BATCH_SIZE) % total_tokens
+        current_batch_indices[server_name] = next_index
+        
+        return batch_tokens
+
+def get_random_batch_tokens(server_name, all_tokens):
+    """Alternative method: use random sampling for better distribution"""
+    if not all_tokens:
+        return []
+    
+    total_tokens = len(all_tokens)
+    
+    # If we have fewer tokens than batch size, use all available tokens
+    if total_tokens <= TOKEN_BATCH_SIZE:
+        return all_tokens.copy()
+    
+    # Randomly select tokens without replacement
+    return random.sample(all_tokens, TOKEN_BATCH_SIZE)
+
+def load_tokens(server_name, for_visit=False):
+    # AB for_visit KA KOI EFFECT NAHI HAI - dono same file se load honge
+    if server_name == "IND":
+        path = "token_ind.json"
+    elif server_name in {"BR", "US", "SAC", "NA"}:
+        path = "token_br.json"
+    else:
+        path = "token_bd.json"
+
+    try:
+        with open(path, "r") as f:
+            tokens = json.load(f)
+            if isinstance(tokens, list) and all(isinstance(t, dict) and "token" in t for t in tokens):
+                # Level filter: level field thakle check koro, na thakle allow koro
+                filtered = [
+                    t for t in tokens
+                    if t.get("level") is None or t.get("level", 0) >= MIN_LEVEL
+                ]
+                skipped = len(tokens) - len(filtered)
+                if skipped > 0:
+                    print(f"Level filter: Skipped {skipped} low-level tokens (level < {MIN_LEVEL}) from {path}")
+                print(f"Loaded {len(filtered)} tokens from {path} for server {server_name}")
+                return filtered
+            else:
+                print(f"Warning: Token file {path} is not in the expected format. Returning empty list.")
+                return []
+    except FileNotFoundError:
+        print(f"Warning: Token file {path} not found. Returning empty list for server {server_name}.")
+        return []
+    except json.JSONDecodeError:
+        print(f"Warning: Token file {path} contains invalid JSON. Returning empty list.")
+        return []
 
 def encrypt_message(plaintext):
-    try:
-        key = b'Yg&tc%DEuh6%Zc^8'
-        iv = b'6oyZDr22E3ychjM%'
-        cipher = AES.new(key, AES.MODE_CBC, iv)
-        padded_message = pad(plaintext, AES.block_size)
-        encrypted_message = cipher.encrypt(padded_message)
-        return binascii.hexlify(encrypted_message).decode('utf-8')
-    except Exception as e:
-        app.logger.error(f"Error encrypting message: {e}")
-        return None
+    key = b'Yg&tc%DEuh6%Zc^8'
+    iv = b'6oyZDr22E3ychjM%'
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    padded_message = pad(plaintext, AES.block_size)
+    encrypted_message = cipher.encrypt(padded_message)
+    return binascii.hexlify(encrypted_message).decode('utf-8')
 
 def create_protobuf_message(user_id, region):
-    try:
-        message = like_pb2.like()
-        message.uid = int(user_id)
-        message.region = region
-        return message.SerializeToString()
-    except Exception as e:
-        app.logger.error(f"Error creating protobuf message: {e}")
-        return None
+    message = like_pb2.like()
+    message.uid = int(user_id)
+    message.region = region
+    return message.SerializeToString()
 
-async def send_request(encrypted_uid, token, url):
-    try:
-        edata = bytes.fromhex(encrypted_uid)
-        headers = {
-            'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
-            'Connection': "Keep-Alive",
-            'Accept-Encoding': "gzip",
-            'Authorization': f"Bearer {token}",
-            'Content-Type': "application/x-www-form-urlencoded",
-            'Expect': "100-continue",
-            'X-Unity-Version': "2018.4.11f1",
-            'X-GA': "v1 1",
-            'ReleaseVersion': "OB55"
-        }
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, data=edata, headers=headers) as response:
-                if response.status != 200:
-                    app.logger.error(f"Request failed with status code: {response.status}")
-                    return response.status
-                return await response.text()
-    except Exception as e:
-        app.logger.error(f"Exception in send_request: {e}")
-        return None
+def create_protobuf_for_profile_check(uid):
+    message = uid_generator_pb2.uid_generator()
+    message.krishna_ = int(uid)
+    message.teamXdarks = 1
+    return message.SerializeToString()
 
-async def send_multiple_requests(uid, server_name, url):
-    try:
-        region = server_name
-        protobuf_message = create_protobuf_message(uid, region)
-        if protobuf_message is None:
-            app.logger.error("Failed to create protobuf message.")
-            return None
-        encrypted_uid = encrypt_message(protobuf_message)
-        if encrypted_uid is None:
-            app.logger.error("Encryption failed.")
-            return None
-        tasks = []
-        tokens = load_tokens(server_name)
-        if tokens is None:
-            app.logger.error("Failed to load tokens.")
-            return None
-        for i in range(1000):
-            token = tokens[i % len(tokens)]["token"]
-            tasks.append(send_request(encrypted_uid, token, url))
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        return results
-    except Exception as e:
-        app.logger.error(f"Exception in send_multiple_requests: {e}")
-        return None
-
-def create_protobuf(uid):
-    try:
-        message = uid_generator_pb2.uid_generator()
-        message.saturn_ = int(uid)
-        message.garena = 1
-        return message.SerializeToString()
-    except Exception as e:
-        app.logger.error(f"Error creating uid protobuf: {e}")
-        return None
-
-def enc(uid):
-    protobuf_data = create_protobuf(uid)
-    if protobuf_data is None:
-        return None
+def enc_profile_check_payload(uid):
+    protobuf_data = create_protobuf_for_profile_check(uid)
     encrypted_uid = encrypt_message(protobuf_data)
     return encrypted_uid
 
-def make_request(encrypt, server_name, token):
+async def send_single_like_request(encrypted_like_payload, token_dict, url, token_index=None):
+    edata = bytes.fromhex(encrypted_like_payload)
+    token_value = token_dict.get("token", "")
+    token_label = f"token[{token_index}]" if token_index is not None else "token"
+    if not token_value:
+        print(f"Warning: send_single_like_request received an empty or invalid {token_label}.")
+        return 999
+
+    headers = {
+        'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
+        'Connection': "Keep-Alive",
+        'Accept-Encoding': "gzip",
+        'Authorization': f"Bearer {token_value}",
+        'Content-Type': "application/x-www-form-urlencoded",
+        'Expect': "100-continue",
+        'X-Unity-Version': "2018.4.12f1",
+        'X-GA': "v1 1",
+        'ReleaseVersion': "OB55"
+    }
     try:
-        if server_name == "IND":
-            url = "https://client.ind.freefiremobile.com/GetPlayerPersonalShow"
-        elif server_name in {"BR", "US", "SAC", "NA"}:
-            url = "https://client.us.freefiremobile.com/GetPlayerPersonalShow"
-        else:
-            url = "https://clientbp.ggblueshark.com/GetPlayerPersonalShow"
-        edata = bytes.fromhex(encrypt)
-        headers = {
-            'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
-            'Connection': "Keep-Alive",
-            'Accept-Encoding': "gzip",
-            'Authorization': f"Bearer {token}",
-            'Content-Type': "application/x-www-form-urlencoded",
-            'Expect': "100-continue",
-            'X-Unity-Version': "2018.4.11f1",
-            'X-GA': "v1 1",
-            'ReleaseVersion': "OB55"
-        }
-        response = requests.post(url, data=edata, headers=headers, verify=False)
-        hex_data = response.content.hex()
-        binary = bytes.fromhex(hex_data)
-        decode = decode_protobuf(binary)
-        if decode is None:
-            app.logger.error("Protobuf decoding returned None.")
-        return decode
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, data=edata, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                status = response.status
+                if status != 200:
+                    try:
+                        response_text = await response.text()
+                    except Exception:
+                        response_text = "<unable to read response body>"
+                    print(f"Like request failed for {token_label} ({token_value[:10]}...) with status: {status}, body: {response_text[:200]}")
+                else:
+                    print(f"Like request succeeded for {token_label} ({token_value[:10]}...) with status: {status}")
+                return status
+    except asyncio.TimeoutError:
+        print(f"Like request timed out for {token_label} ({token_value[:10]}...)")
+        return 998
     except Exception as e:
-        app.logger.error(f"Error in make_request: {e}")
+        print(f"Exception in send_single_like_request for {token_label} ({token_value[:10]}...): {e}")
+        return 997
+
+async def send_likes_with_token_batch(uid, server_region_for_like_proto, like_api_url, token_batch_to_use):
+    if not token_batch_to_use:
+        print("No tokens provided in the batch to send_likes_with_token_batch.")
+        return []
+
+    like_protobuf_payload = create_protobuf_message(uid, server_region_for_like_proto)
+    encrypted_like_payload = encrypt_message(like_protobuf_payload)
+    
+    tasks = []
+    for index, token_dict_for_request in enumerate(token_batch_to_use):
+        tasks.append(send_single_like_request(encrypted_like_payload, token_dict_for_request, like_api_url, token_index=index))
+    
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    successful_sends = sum(1 for r in results if isinstance(r, int) and r == 200)
+    failed_sends = len(token_batch_to_use) - successful_sends
+    print(f"Attempted {len(token_batch_to_use)} like sends from batch. Successful: {successful_sends}, Failed/Error: {failed_sends}")
+    return results
+
+def make_profile_check_request(encrypted_profile_payload, server_name, token_dict):
+    token_value = token_dict.get("token", "")
+    if not token_value:
+        print("Warning: make_profile_check_request received an empty token_dict.")
         return None
 
-def decode_protobuf(binary):
+    if server_name == "IND":
+        url = "https://client.ind.freefiremobile.com/GetPlayerPersonalShow"
+    elif server_name in {"BR", "US", "SAC", "NA"}:
+        url = "https://client.us.freefiremobile.com/GetPlayerPersonalShow"
+    else:
+        url = "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow"
+
+    edata = bytes.fromhex(encrypted_profile_payload)
+    headers = {
+        'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
+        'Connection': "Keep-Alive",
+        'Accept-Encoding': "gzip",
+        'Authorization': f"Bearer {token_value}",
+        'Content-Type': "application/x-www-form-urlencoded",
+        'Expect': "100-continue",
+        'X-Unity-Version': "2018.4.12f1",
+        'X-GA': "v1 1",
+        'ReleaseVersion': "OB55"
+    }
+    try:
+        response = requests.post(url, data=edata, headers=headers, verify=False, timeout=10)
+        response.raise_for_status()
+        binary_data = response.content
+        decoded_info = decode_protobuf_profile_info(binary_data)
+        return decoded_info
+    except requests.exceptions.HTTPError as e:
+        print(f"HTTP error in make_profile_check_request for token {token_value[:10]}...: {e.response.status_code} - {e.response.text[:100]}")
+    except requests.exceptions.RequestException as e:
+        print(f"Request error in make_profile_check_request for token {token_value[:10]}...: {e}")
+    except Exception as e:
+        print(f"Unexpected error in make_profile_check_request for token {token_value[:10]}... processing response: {e}")
+    return None
+
+def decode_protobuf_profile_info(binary_data):
     try:
         items = like_count_pb2.Info()
-        items.ParseFromString(binary)
+        items.ParseFromString(binary_data)
         return items
-    except DecodeError as e:
-        app.logger.error(f"Error decoding Protobuf data: {e}")
-        return None
     except Exception as e:
-        app.logger.error(f"Unexpected error during protobuf decoding: {e}")
+        print(f"Error decoding Protobuf profile data: {e}")
         return None
+
+app = Flask(__name__)
+
+@app.route('/', methods=['GET'])
+def index():
+    example_uid = 1187994195
+    example_server = "IND"
+    example_url = f"/like?uid={example_uid}&server_name={example_server}"
+    return f"""
+    <html>
+      <head><title>Like API Home</title></head>
+      <body>
+        <h1>Like API</h1>
+        <p>Click the link below to send a like request:</p>
+        <p><a href=\"{example_url}\">{example_url}</a></p>
+        <p>Replace <code>uid</code> and <code>server_name</code> with your values.</p>
+        <p>For token status, visit <a href=\"/token_info\">/token_info</a>.</p>
+      </body>
+    </html>
+    """
 
 @app.route('/like', methods=['GET'])
 def handle_requests():
-    uid = request.args.get("uid")
-    server_name = request.args.get("server_name", "").upper()
-    if not uid or not server_name:
+    uid_param = request.args.get("uid")
+    server_name_param = request.args.get("server_name", "").upper()
+    use_random = request.args.get("random", "false").lower() == "true"
+
+    if not uid_param or not server_name_param:
         return jsonify({"error": "UID and server_name are required"}), 400
 
-    try:
-        def process_request():
-            tokens = load_tokens(server_name)
-            if tokens is None:
-                raise Exception("Failed to load tokens.")
-            token = tokens[0]['token']
-            encrypted_uid = enc(uid)
-            if encrypted_uid is None:
-                raise Exception("Encryption of UID failed.")
+    # AB SIRF EK HI FILE SE SARE TOKENS LOAD KARTE HAIN (Regular + Profile check dono ke liye same)
+    all_available_tokens = load_tokens(server_name_param, for_visit=False)
+    if not all_available_tokens:
+        return jsonify({"error": f"No tokens loaded or token file invalid for server {server_name_param}."}), 500
 
-            before = make_request(encrypted_uid, server_name, token)
-            if before is None:
-                raise Exception("Failed to retrieve initial player info.")
-            try:
-                jsone = MessageToJson(before)
-            except Exception as e:
-                raise Exception(f"Error converting 'before' protobuf to JSON: {e}")
-            data_before = json.loads(jsone)
-            before_like = data_before.get('AccountInfo', {}).get('Likes', 0)
-            try:
-                before_like = int(before_like)
-            except Exception:
-                before_like = 0
-            app.logger.info(f"Likes before command: {before_like}")
+    print(f"Total tokens available for {server_name_param}: {len(all_available_tokens)}")
 
-            if server_name == "IND":
-                url = "https://client.ind.freefiremobile.com/LikeProfile"
-            elif server_name in {"BR", "US", "SAC", "NA"}:
-                url = "https://client.us.freefiremobile.com/LikeProfile"
-            else:
-                url = "https://clientbp.ggblueshark.com/LikeProfile"
+    # Profile check ke liye bhi yahi se ek token le lo (e.g. first token)
+    token_for_profile_check = all_available_tokens[0] if all_available_tokens else None
+    if not token_for_profile_check:
+        return jsonify({"error": f"Cannot get a token for profile check from {server_name_param}."}), 500
 
-            asyncio.run(send_multiple_requests(uid, server_name, url))
-
-            after = make_request(encrypted_uid, server_name, token)
-            if after is None:
-                raise Exception("Failed to retrieve player info after like requests.")
-            try:
-                jsone_after = MessageToJson(after)
-            except Exception as e:
-                raise Exception(f"Error converting 'after' protobuf to JSON: {e}")
-            data_after = json.loads(jsone_after)
-            after_like = int(data_after.get('AccountInfo', {}).get('Likes', 0))
-            player_uid = int(data_after.get('AccountInfo', {}).get('UID', 0))
-            player_name = str(data_after.get('AccountInfo', {}).get('PlayerNickname', ''))
-            like_given = after_like - before_like
-            status = 1 if like_given != 0 else 2
-            result = {
-                "LikesGivenByAPI": like_given,
-                "LikesbeforeCommand": before_like,
-                "LikesafterCommand": after_like,
-                "PlayerNickname": player_name,
-                "UID": player_uid,
-                "status": status
-            }
-            return result
-
-        result = process_request()
-        return jsonify(result)
-    except Exception as e:
-        app.logger.error(f"Error processing request: {e}")
-        return jsonify({"error": str(e)}), 500
-@app.route("/", methods=["GET"])
-def home():
-    return jsonify({
-        "credits": "Dev By ug",
-        "discord": "/like?uid=3113497298&server_name=IND"
-    })
-if __name__ == '__main__':
+    # Get the batch of tokens for like sending
+    if use_random:
+        tokens_for_like_sending = get_random_batch_tokens(server_name_param, all_available_tokens)
+        print(f"Using RANDOM batch selection for {server_name_param}")
+    else:
+        tokens_for_like_sending = get_next_batch_tokens(server_name_param, all_available_tokens)
+        print(f"Using ROTATING batch selection for {server_name_param}")
     
-    app.run(debug=True, use_reloader=False)
+    encrypted_player_uid_for_profile = enc_profile_check_payload(uid_param)
+    
+    # Get likes BEFORE using profile check token
+    before_info = make_profile_check_request(encrypted_player_uid_for_profile, server_name_param, token_for_profile_check)
+    before_like_count = 0
+    
+    if before_info and hasattr(before_info, 'AccountInfo'):
+        before_like_count = int(before_info.AccountInfo.Likes)
+    else:
+        print(f"Could not reliably fetch 'before' profile info for UID {uid_param} on {server_name_param}.")
+
+    print(f"UID {uid_param} ({server_name_param}): Likes before = {before_like_count}")
+
+    # Determine the URL for sending likes
+    if server_name_param == "IND":
+        like_api_url = "https://client.ind.freefiremobile.com/LikeProfile"
+    elif server_name_param in {"BR", "US", "SAC", "NA"}:
+        like_api_url = "https://client.us.freefiremobile.com/LikeProfile"
+    else:
+        like_api_url = "https://clientbp.ggpolarbear.com/LikeProfile"
+
+    if tokens_for_like_sending:
+        print(f"Using token batch for {server_name_param} (size {len(tokens_for_like_sending)}) to send likes.")
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(send_likes_with_token_batch(uid_param, server_name_param, like_api_url, tokens_for_like_sending))
+        finally:
+            loop.close()
+    else:
+        print(f"Skipping like sending for UID {uid_param} as no tokens available for like sending.")
+        
+    # Get likes AFTER using profile check token (same token pool se)
+    after_info = make_profile_check_request(encrypted_player_uid_for_profile, server_name_param, token_for_profile_check)
+    after_like_count = before_like_count
+    actual_player_uid_from_profile = int(uid_param)
+    player_nickname_from_profile = "N/A"
+
+    if after_info and hasattr(after_info, 'AccountInfo'):
+        after_like_count = int(after_info.AccountInfo.Likes)
+        actual_player_uid_from_profile = int(after_info.AccountInfo.UID)
+        if after_info.AccountInfo.PlayerNickname:
+            player_nickname_from_profile = str(after_info.AccountInfo.PlayerNickname)
+        else:
+            player_nickname_from_profile = "N/A"
+    else:
+        print(f"Could not reliably fetch 'after' profile info for UID {uid_param} on {server_name_param}.")
+
+    print(f"UID {uid_param} ({server_name_param}): Likes after = {after_like_count}")
+
+    likes_increment = after_like_count - before_like_count
+    request_status = 1 if likes_increment > 0 else (2 if likes_increment == 0 else 3)
+
+    response_data = {
+        "LikesGivenByAPI": likes_increment,
+        "LikesafterCommand": after_like_count,
+        "LikesbeforeCommand": before_like_count,
+        "PlayerNickname": player_nickname_from_profile,
+        "UID": actual_player_uid_from_profile,
+        "status": request_status,
+        "Note": f"Used same token pool for profile check and {'random' if use_random else 'rotating'} batch of {len(tokens_for_like_sending)} tokens for like sending."
+    }
+    return jsonify(response_data)
+
+@app.route('/token_info', methods=['GET'])
+def token_info():
+    """Endpoint to check token counts for each server"""
+    servers = ["IND", "BD", "BR", "US", "SAC", "NA"]
+    info = {}
+    
+    for server in servers:
+        regular_tokens = load_tokens(server, for_visit=False)
+        # Visit tokens ab exist nahi karte, bas same regular tokens hi dikhao
+        info[server] = {
+            "regular_tokens": len(regular_tokens),
+            "visit_tokens": "Not used anymore (same as regular tokens)"
+        }
+    
+    return jsonify(info)
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
+# STAR LIKE API SRC  
+# POWERED BY : @STAR_GMR
+# CHANNEL : @STAR_METHODE
